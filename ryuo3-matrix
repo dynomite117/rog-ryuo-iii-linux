@@ -1,0 +1,596 @@
+#!/usr/bin/env python3
+"""Userspace driver for the ASUS ROG RYUO III AniMe Matrix (USB 0b05:1a51).
+
+The pump cap carries a round matrix of 255 RGB LEDs in 19 columns (heights
+3 9 12 13 15 16 17x7 16 15 13 12 9 3, each column centered, so even-height
+columns sit half a pitch off the odd ones). Protocol, verified on this cooler
+(firmware AURO1-S452-0101):
+
+  HID interface 1, report id 0xEC, 64-byte payload, written to hidraw:
+    EC 82          -> EC 02 00 "AURO1-S452-0101"   firmware
+    EC 42 01       -> EC 42                         enable host-driven matrix
+    EC C1          -> EC 41 ...                     frame companion / status
+    EC 7F 04 00 03 -> EC 7F 00 00 03                announce a 0x300-byte frame
+  Bulk OUT EP 0x01 on interface 0: 768-byte frame  -> event EE 40
+
+  Frame layout: 16 blocks of 48 bytes; each block is a 16-byte R plane, G plane,
+  B plane. The LED chain starts at the top of the rightmost column (seen from
+  the front, hoses up) and runs down each column, right to left. Chain LED n
+  lives in block 4*(n//64) + n%4, slot (n%64)//4. Slot 255 is unused.
+  (Mapped 2026-10-09 from photos of test patterns.)
+
+Only the commands above are sent. Do not add guessed command ids: the sibling
+Ryujin firmware has undocumented FormatDisk / chip-write commands.
+
+Requires root or the udev rule shipped alongside. Pillow is optional (images).
+"""
+import argparse
+import ctypes
+import datetime
+import errno
+import fcntl
+import glob
+import math
+import os
+import select
+import struct
+import sys
+import time
+
+VID, PID = 0x0B05, 0x1A51
+HID_ID = "HID_ID=0003:00000B05:00001A51"
+CONFIG = "/etc/ryuo3-matrix.conf"
+FRAME_SIZE = 768
+SIZE = 19                       # canvas is SIZE x SIZE; the round panel fits inside it
+
+USBDEVFS_BULK = 0xC0185502
+USBDEVFS_CLAIMINTERFACE = 0x8004550F
+USBDEVFS_RELEASEINTERFACE = 0x80045510
+
+
+# --- LED map ---------------------------------------------------------------------
+COLUMN_HEIGHTS = (3, 9, 12, 13, 15, 16, 17, 17, 17, 17, 17, 17, 17, 16, 15, 13, 12, 9, 3)
+
+
+def _leds():
+    """[(R byte, x, y)] with x, y in LED pitches from the panel center (+x right, +y down)."""
+    leds, n = [], 0
+    for ci, height in enumerate(COLUMN_HEIGHTS):          # chain order: rightmost column first
+        x = (len(COLUMN_HEIGHTS) - 1) / 2 - ci
+        for k in range(height):                            # top to bottom
+            r_byte = (4 * (n // 64) + n % 4) * 48 + (n % 64) // 4
+            leds.append((r_byte, x, k - (height - 1) / 2))
+            n += 1
+    return leds
+
+
+LEDS = _leds()
+
+
+# --- device ------------------------------------------------------------------------
+class MatrixError(Exception):
+    pass
+
+
+def find_device():
+    """Return (hidraw path, usbfs path) for the cooler."""
+    for uev in sorted(glob.glob("/sys/class/hidraw/hidraw*/device/uevent")):
+        try:
+            with open(uev) as f:
+                if HID_ID not in f.read().upper():
+                    continue
+        except OSError:
+            continue
+        node = os.path.realpath(os.path.dirname(uev))
+        while node != "/":
+            try:
+                with open(os.path.join(node, "idVendor")) as f:
+                    if int(f.read(), 16) == VID:
+                        with open(os.path.join(node, "busnum")) as b, open(os.path.join(node, "devnum")) as d:
+                            usb = f"/dev/bus/usb/{int(b.read()):03d}/{int(d.read()):03d}"
+                        return "/dev/" + uev.split("/")[4], usb
+            except (OSError, ValueError):
+                pass
+            node = os.path.dirname(node)
+    raise MatrixError("ROG RYUO III (0b05:1a51) not found")
+
+
+class Matrix:
+    def __init__(self):
+        self.hid_path, self.usb_path = find_device()
+        try:
+            self.hid = os.open(self.hid_path, os.O_RDWR | os.O_NONBLOCK)
+            self.usb = os.open(self.usb_path, os.O_RDWR)
+        except PermissionError:
+            raise MatrixError("permission denied: run as root or install 60-ryuo3-matrix.rules")
+        try:
+            fcntl.ioctl(self.usb, USBDEVFS_CLAIMINTERFACE, struct.pack("I", 0))
+        except OSError as e:
+            os.close(self.usb)
+            os.close(self.hid)
+            if e.errno == errno.EBUSY:
+                raise MatrixError("matrix is in use by another process (is ryuo3-matrix.service running?)")
+            raise
+        self.firmware = self._trim(self.cmd(b"\x82", 0x02)[3:]).decode("ascii", "replace")
+        self.cmd(b"\xC1", 0x41)
+        self.cmd(b"\x42\x01", 0x42)
+
+    @staticmethod
+    def _trim(b):
+        return bytes(b).rstrip(b"\0")
+
+    def _read(self, timeout):
+        if not select.select([self.hid], [], [], timeout)[0]:
+            return None
+        return os.read(self.hid, 65)
+
+    def cmd(self, payload, reply, timeout=1.0):
+        os.write(self.hid, b"\xEC" + bytes(payload).ljust(64, b"\0"))
+        end = time.monotonic() + timeout
+        while (left := end - time.monotonic()) > 0:
+            r = self._read(left)
+            if r and len(r) >= 2 and r[0] == 0xEC and r[1] == reply:
+                return r
+        raise MatrixError(f"no reply to command {payload[0]:02X}")
+
+    def send(self, frame):
+        if len(frame) != FRAME_SIZE:
+            raise ValueError("frame must be 768 bytes")
+        self.cmd(b"\xC1", 0x41)
+        self.cmd(b"\x7F\x04\x00\x03", 0x7F)
+        buf = ctypes.create_string_buffer(bytes(frame), FRAME_SIZE)
+        arg = bytearray(struct.pack("IIIxxxxQ", 0x01, FRAME_SIZE, 2000, ctypes.addressof(buf)))
+        n = fcntl.ioctl(self.usb, USBDEVFS_BULK, arg, True)
+        if n != FRAME_SIZE:
+            raise MatrixError(f"short bulk write {n}/{FRAME_SIZE}")
+        end = time.monotonic() + 0.5          # frame-received event EE 40
+        while (left := end - time.monotonic()) > 0:
+            r = self._read(left)
+            if r and r[0] == 0xEE:
+                break
+
+    def close(self):
+        try:
+            fcntl.ioctl(self.usb, USBDEVFS_RELEASEINTERFACE, struct.pack("I", 0))
+        except OSError:
+            pass
+        os.close(self.usb)
+        os.close(self.hid)
+
+
+# --- canvas --------------------------------------------------------------------------
+class Canvas:
+    """SIZE x SIZE drawing surface. Each LED shows the canvas pixel under its center;
+    `rotate` turns the picture clockwise to match how the pump is mounted."""
+
+    def __init__(self, rotate=0, brightness=100):
+        self.w = self.h = SIZE
+        self.scale = max(0, min(100, brightness)) / 100
+        self.px = {}
+        c = (SIZE - 1) / 2
+        rad = math.radians(rotate)
+        cos, sin = round(math.cos(rad)), round(math.sin(rad))
+        self.sample = []
+        for r_byte, x, y in LEDS:
+            u = x * cos + y * sin                 # canvas point that lands on this LED
+            v = -x * sin + y * cos
+            self.sample.append((r_byte, math.floor(u + c + 0.5), math.floor(v + c + 0.5)))
+
+    def clear(self):
+        self.px.clear()
+
+    def set(self, x, y, rgb):
+        if 0 <= x < self.w and 0 <= y < self.h:
+            self.px[(x, y)] = rgb
+
+    def fill(self, rgb):
+        for x in range(self.w):
+            for y in range(self.h):
+                self.px[(x, y)] = rgb
+
+    def frame(self):
+        f = bytearray(FRAME_SIZE)
+        for r_byte, x, y in self.sample:
+            rgb = self.px.get((x, y))
+            if rgb:
+                for ch in range(3):
+                    f[r_byte + 16 * ch] = min(255, int(rgb[ch] * self.scale))
+        return bytes(f)
+
+
+# --- 3x5 font -------------------------------------------------------------------------
+FONT = {
+    "0": "111 101 101 101 111", "1": "010 110 010 010 111", "2": "111 001 111 100 111",
+    "3": "111 001 111 001 111", "4": "101 101 111 001 001", "5": "111 100 111 001 111",
+    "6": "111 100 111 101 111", "7": "111 001 010 010 010", "8": "111 101 111 101 111",
+    "9": "111 101 111 001 111", "A": "010 101 111 101 101", "B": "110 101 110 101 110",
+    "C": "011 100 100 100 011", "D": "110 101 101 101 110", "E": "111 100 110 100 111",
+    "F": "111 100 110 100 100", "G": "011 100 101 101 011", "H": "101 101 111 101 101",
+    "I": "111 010 010 010 111", "J": "001 001 001 101 010", "K": "101 101 110 101 101",
+    "L": "100 100 100 100 111", "M": "101 111 111 101 101", "N": "110 101 101 101 101",
+    "O": "010 101 101 101 010", "P": "110 101 110 100 100", "Q": "010 101 101 110 011",
+    "R": "110 101 110 101 101", "S": "011 100 010 001 110", "T": "111 010 010 010 010",
+    "U": "101 101 101 101 111", "V": "101 101 101 101 010", "W": "101 101 111 111 101",
+    "X": "101 101 010 101 101", "Y": "101 101 010 010 010", "Z": "111 001 010 100 111",
+    " ": "00 00 00 00 00", ":": "0 1 0 1 0", ".": "0 0 0 0 1", "!": "1 1 1 0 1",
+    "-": "000 000 111 000 000", "+": "000 010 111 010 000", "=": "000 111 000 111 000",
+    "%": "101 001 010 100 101", "/": "001 001 010 100 100", "?": "111 001 011 000 010",
+    "°": "11 11 00 00 00",
+}
+
+
+def glyph(ch):
+    return FONT.get(ch.upper(), FONT["?"]).split()
+
+
+def text_width(s):
+    return sum(len(glyph(c)[0]) + 1 for c in s) - 1 if s else 0
+
+
+def draw_text(cv, s, rgb, x=None, y=None):
+    """Draw text; "\n" separates lines. Each line is centered unless x is given,
+    the block is centered vertically unless y is given."""
+    lines = s.split("\n")
+    top = (cv.h - (6 * len(lines) - 1)) // 2 if y is None else y
+    for i, line in enumerate(lines):
+        cx = (cv.w - text_width(line)) // 2 if x is None else x
+        for ch in line:
+            g = glyph(ch)
+            for gy, row in enumerate(g):
+                for gx, bit in enumerate(row):
+                    if bit == "1":
+                        cv.set(cx + gx, top + 6 * i + gy, rgb)
+            cx += len(g[0]) + 1
+
+
+# --- helpers ------------------------------------------------------------------------
+COLORS = {
+    "white": (255, 255, 255), "red": (255, 0, 0), "green": (0, 255, 0), "blue": (0, 0, 255),
+    "yellow": (255, 200, 0), "orange": (255, 90, 0), "purple": (160, 0, 255), "pink": (255, 40, 120),
+    "cyan": (0, 220, 255), "magenta": (255, 0, 255), "black": (0, 0, 0), "off": (0, 0, 0),
+}
+
+
+def parse_color(s):
+    s = s.strip().lower()
+    if s in COLORS:
+        return COLORS[s]
+    h = s.lstrip("#")
+    if len(h) == 6:
+        try:
+            return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+        except ValueError:
+            pass
+    raise argparse.ArgumentTypeError(f"bad color {s!r} (name or RRGGBB)")
+
+
+def parse_crop(s):
+    try:
+        x, y, w, h = (int(v) for v in s.split(","))
+    except ValueError:
+        raise argparse.ArgumentTypeError("crop must be X,Y,W,H")
+    if w <= 0 or h <= 0 or x < 0 or y < 0:
+        raise argparse.ArgumentTypeError("crop needs X,Y >= 0 and W,H > 0")
+    return x, y, w, h
+
+
+def hsv(h, s=1.0, v=1.0):
+    i = int(h * 6) % 6
+    f = h * 6 - int(h * 6)
+    p, q, t = v * (1 - s), v * (1 - f * s), v * (1 - (1 - f) * s)
+    r, g, b = [(v, t, p), (q, v, p), (p, v, t), (p, q, v), (t, p, v), (v, p, q)][i]
+    return int(r * 255), int(g * 255), int(b * 255)
+
+
+def temp_color(t):
+    """Green below 45C, through yellow, red at 85C+."""
+    k = max(0.0, min(1.0, (t - 45) / 40))
+    return hsv(0.33 * (1 - k))
+
+
+def read_temp(kind):
+    names = {"cpu": ("k10temp", "zenpower", "coretemp"), "gpu": ("amdgpu", "nouveau", "nvidia")}[kind]
+    for d in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        try:
+            with open(d + "/name") as f:
+                if f.read().strip() not in names:
+                    continue
+            with open(d + "/temp1_input") as f:
+                return int(f.read()) / 1000
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def load_config():
+    cfg = {}
+    try:
+        with open(CONFIG) as f:
+            for line in f:
+                line = line.split("#")[0].strip()
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    cfg[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return cfg
+
+
+class Session:
+    """Owns the device; reconnects after unplug/suspend in long-running modes."""
+
+    def __init__(self, args):
+        self.args = args
+        self.dev = None
+
+    def canvas(self):
+        return Canvas(self.args.rotate, self.args.brightness)
+
+    def show(self, cv):
+        frame = cv.frame()
+        while True:
+            try:
+                if self.dev is None:
+                    self.dev = Matrix()
+                self.dev.send(frame)
+                return
+            except (OSError, MatrixError) as e:
+                if self.dev is not None:
+                    try:
+                        self.dev.close()
+                    except OSError:
+                        pass
+                    self.dev = None
+                if not self.args.persistent:
+                    raise MatrixError(str(e))
+                time.sleep(2)
+
+    def close(self):
+        if self.dev:
+            self.dev.close()
+
+
+# --- commands -------------------------------------------------------------------------
+def cmd_info(s):
+    d = Matrix()
+    print(f"device    ROG RYUO III  hidraw {d.hid_path}  usb {d.usb_path}")
+    print(f"firmware  {d.firmware}")
+    print(f"matrix    {len(LEDS)} RGB LEDs, round, {len(COLUMN_HEIGHTS)} columns")
+    d.close()
+
+
+def cmd_fill(s):
+    cv = s.canvas()
+    cv.fill(s.args.color)
+    s.show(cv)
+
+
+def cmd_off(s):
+    s.show(s.canvas())
+
+
+def cmd_text(s):
+    a = s.args
+    cv = s.canvas()
+    text = a.text.replace("\\n", "\n")
+    width = max(text_width(line) for line in text.split("\n"))
+    if not a.scroll and width <= cv.w - 2:
+        draw_text(cv, text, a.color)
+        s.show(cv)
+        return
+    a.persistent = True
+    text = text.replace("\n", "  ")
+    while True:
+        for off in range(cv.w, -text_width(text) - 1, -1):
+            cv.clear()
+            draw_text(cv, text, a.color, x=off)
+            s.show(cv)
+            time.sleep(1 / a.speed)
+        if a.once:
+            return
+
+
+def draw_clock(cv, now, h24, rgb, seconds):
+    hour = now.hour if h24 else (now.hour % 12 or 12)
+    draw_text(cv, f"{hour:02d}\n{now.minute:02d}", rgb)
+    if seconds:                                       # one dot orbiting the rim
+        c = (SIZE - 1) / 2
+        ang = 2 * math.pi * now.second / 60
+        cv.set(round(c + 8.4 * math.sin(ang)), round(c - 8.4 * math.cos(ang)), (255, 40, 40))
+
+
+def cmd_clock(s):
+    a = s.args
+    a.persistent = True
+    cv = s.canvas()
+    while True:
+        cv.clear()
+        draw_clock(cv, datetime.datetime.now(), a.h24, a.color, a.seconds)
+        s.show(cv)
+        time.sleep(1.0 - (time.time() % 1.0))
+
+
+def cmd_monitor(s):
+    a = s.args
+    a.persistent = True
+    cv = s.canvas()
+    pages = [p.strip() for p in a.show.split(",") if p.strip()]
+    for p in pages:
+        if p not in ("cpu", "gpu", "clock"):
+            raise MatrixError(f"unknown monitor page {p!r} (cpu, gpu, clock)")
+    while True:
+        for page in pages:
+            end = time.monotonic() + a.interval
+            while True:
+                cv.clear()
+                if page == "clock":
+                    draw_clock(cv, datetime.datetime.now(), a.h24, (255, 255, 255), True)
+                else:
+                    t = read_temp(page)
+                    draw_text(cv, page.upper(), (110, 110, 110), y=3)
+                    if t is None:
+                        draw_text(cv, "N/A", (100, 100, 100), y=10)
+                    else:
+                        draw_text(cv, f"{t:.0f}°", temp_color(t), y=10)
+                s.show(cv)
+                if len(pages) == 1 or time.monotonic() >= end:
+                    break
+                time.sleep(1)
+            if len(pages) == 1:
+                time.sleep(1)
+
+
+def cmd_rainbow(s):
+    s.args.persistent = True
+    cv = s.canvas()
+    c = (SIZE - 1) / 2
+    t = 0.0
+    while True:
+        for x in range(cv.w):
+            for y in range(cv.h):
+                ang = math.atan2(y - c, x - c) / (2 * math.pi)
+                cv.set(x, y, hsv((ang + t) % 1.0))
+        s.show(cv)
+        t += 0.01
+        time.sleep(1 / 30)
+
+
+def prepare_frame(fr, a):
+    """One source frame -> SIZE x SIZE RGB image, background keyed out and colors boosted."""
+    from PIL import Image, ImageChops, ImageEnhance
+    rgba = fr.convert("RGBA")
+    if a.remove_bg == "auto":
+        # per-channel median of the uncropped frame's corners: right whenever 3 of 4 are background
+        full = rgba.convert("RGB")
+        corners = [full.getpixel(p) for p in ((0, 0), (full.width - 1, 0),
+                                              (0, full.height - 1), (full.width - 1, full.height - 1))]
+        bg = tuple(sorted(c[ch] for c in corners)[1] for ch in range(3))
+    elif a.remove_bg:
+        bg = parse_color(a.remove_bg)
+    if a.crop:
+        x, y, w, h = a.crop
+        rgba = rgba.crop((x, y, x + w, y + h))
+    if a.remove_bg:
+        # key out the background before scaling so edges fade to black, not to the background
+        rgb = rgba.convert("RGB")
+        diff = ImageChops.difference(rgb, Image.new("RGB", rgb.size, bg)).split()
+        dist = ImageChops.lighter(ImageChops.lighter(diff[0], diff[1]), diff[2])
+        keep = dist.point(lambda v: 255 if v > a.tolerance else 0)
+        rgba.putalpha(ImageChops.multiply(rgba.getchannel("A"), keep))
+    black = Image.new("RGBA", rgba.size, (0, 0, 0, 255))
+    rgb = Image.alpha_composite(black, rgba).convert("RGB")
+    if a.fill:                                        # center-crop to a square
+        side = min(rgb.size)
+        ox, oy = (rgb.width - side) // 2, (rgb.height - side) // 2
+        rgb = rgb.crop((ox, oy, ox + side, oy + side))
+    else:                                             # pad to a square with black
+        side = max(rgb.size)
+        sq = Image.new("RGB", (side, side))
+        sq.paste(rgb, ((side - rgb.width) // 2, (side - rgb.height) // 2))
+        rgb = sq
+    rgb = rgb.resize((SIZE, SIZE), Image.LANCZOS)
+    return ImageEnhance.Color(rgb).enhance(a.saturation)
+
+
+def cmd_image(s):
+    try:
+        from PIL import Image, ImageSequence
+    except ImportError:
+        raise MatrixError("images need Pillow: dnf install python-pillow  (or pip install pillow)")
+    a = s.args
+    try:
+        im = Image.open(a.file)
+    except OSError as e:
+        raise MatrixError(f"cannot open image: {e}")
+    frames = []
+    for fr in ImageSequence.Iterator(im):
+        small = prepare_frame(fr, a)
+        c = s.canvas()
+        for y in range(SIZE):
+            for x in range(SIZE):
+                c.set(x, y, small.getpixel((x, y)))
+        frames.append((c, fr.info.get("duration", 100) / 1000))
+    if len(frames) == 1:
+        s.show(frames[0][0])
+        return
+    a.persistent = True
+    while True:
+        for c, dur in frames:
+            s.show(c)
+            time.sleep(max(dur, 0.02))
+        if a.once:
+            return
+
+
+def cmd_orient(s):
+    """Arrow pointing up plus 'UP', to pick the --rotate that matches the pump mounting."""
+    cv = s.canvas()
+    red, green = (255, 0, 0), (0, 255, 0)
+    for y in range(2, 9):
+        cv.set(9, y, red)
+    for dx, dy in ((-1, 3), (1, 3), (-2, 4), (2, 4), (-3, 5), (3, 5)):
+        cv.set(9 + dx, dy, red)
+    draw_text(cv, "UP", green, y=11)
+    s.show(cv)
+
+
+def main():
+    cfg = load_config()
+    p = argparse.ArgumentParser(prog="ryuo3-matrix", description="Drive the ASUS ROG RYUO III AniMe Matrix.")
+    p.add_argument("--rotate", type=int, choices=(0, 90, 180, 270), default=int(cfg.get("rotate", 0)),
+                   help=f"rotate the picture clockwise (default from {CONFIG}, else 0)")
+    p.add_argument("--brightness", type=int, default=int(cfg.get("brightness", 60)), metavar="0-100",
+                   help="LED brightness percent (default 60)")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("info", help="show device and firmware").set_defaults(fn=cmd_info)
+    sp = sub.add_parser("fill", help="fill the matrix with one color")
+    sp.add_argument("color", type=parse_color)
+    sp.set_defaults(fn=cmd_fill)
+    sub.add_parser("off", help="turn all LEDs off").set_defaults(fn=cmd_off)
+    sp = sub.add_parser("text", help="show text (scrolls automatically when too long)")
+    sp.add_argument("text")
+    sp.add_argument("--color", type=parse_color, default=(255, 255, 255))
+    sp.add_argument("--scroll", action="store_true", help="scroll even if it fits")
+    sp.add_argument("--speed", type=float, default=12, help="scroll speed, pixels/second")
+    sp.add_argument("--once", action="store_true", help="scroll once and exit")
+    sp.set_defaults(fn=cmd_text)
+    sp = sub.add_parser("clock", help="run a clock (stays running)")
+    sp.add_argument("--color", type=parse_color, default=(255, 255, 255))
+    sp.add_argument("--24h", dest="h24", action="store_true")
+    sp.add_argument("--seconds", action="store_true", help="show a seconds dot orbiting the rim")
+    sp.set_defaults(fn=cmd_clock)
+    sp = sub.add_parser("monitor", help="show CPU/GPU temperature and/or clock (stays running)")
+    sp.add_argument("--show", default="cpu", help="pages to cycle, comma separated: cpu,gpu,clock")
+    sp.add_argument("--interval", type=float, default=8, help="seconds per page when cycling")
+    sp.add_argument("--24h", dest="h24", action="store_true")
+    sp.set_defaults(fn=cmd_monitor)
+    sub.add_parser("rainbow", help="animated rainbow (stays running)").set_defaults(fn=cmd_rainbow)
+    sp = sub.add_parser("image", help="show an image or animated GIF (needs Pillow)")
+    sp.add_argument("file")
+    sp.add_argument("--crop", type=parse_crop, metavar="X,Y,W,H", help="use only this region of the source (pixels)")
+    sp.add_argument("--remove-bg", nargs="?", const="auto", metavar="COLOR",
+                    help="turn the background off: color name/RRGGBB, or auto-detect from the corners")
+    sp.add_argument("--tolerance", type=int, default=40, help="how close to the background color counts as background (0-255, default 40)")
+    sp.add_argument("--saturation", type=float, default=1.3, help="color boost; LEDs look washed out at 1.0 (default 1.3)")
+    sp.add_argument("--fill", action="store_true", help="crop to fill the panel instead of fitting the whole picture")
+    sp.add_argument("--once", action="store_true", help="play an animation once and exit")
+    sp.set_defaults(fn=cmd_image)
+    sub.add_parser("orient", help="show an arrow pointing up, to pick --rotate").set_defaults(fn=cmd_orient)
+
+    args = p.parse_args()
+    args.persistent = False
+    s = Session(args)
+    try:
+        args.fn(s)
+    except KeyboardInterrupt:
+        pass
+    except MatrixError as e:
+        print(f"ryuo3-matrix: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        s.close()
+
+
+if __name__ == "__main__":
+    main()

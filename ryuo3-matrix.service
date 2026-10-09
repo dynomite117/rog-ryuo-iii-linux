@@ -1,0 +1,14 @@
+[Unit]
+Description=ASUS ROG RYUO III AniMe Matrix boot picture
+
+[Service]
+# Sends one picture and exits; the cooler keeps showing it. Also started by the
+# udev rule whenever the cooler (re)appears, e.g. after suspend.
+# For a live display instead, use e.g.:  ExecStart=/usr/local/bin/ryuo3-matrix monitor --show cpu,clock
+Type=oneshot
+ExecStart=/usr/local/bin/ryuo3-matrix image /usr/local/share/ryuo3-matrix/boot.png --crop 290,165,660,535 --remove-bg
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

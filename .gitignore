@@ -1,0 +1,5 @@
+__pycache__/
+*.npy
+# personal pictures and the original photo files (copies live in docs/)
+ChatGPT Image*.png
+photo_*.jpg
